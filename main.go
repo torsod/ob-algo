@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"math/rand"
-	"sort"
 	"time"
 )
 
@@ -34,12 +33,9 @@ type PriceLevel struct {
 }
 
 type AuctionBook struct {
-	BidLevels    map[Price]*PriceLevel
-	SortedLevels []*PriceLevel // descending price, built at lock
-	LevelCount   int
-	LevelsDirty  bool
+	BidLevels map[Price]*PriceLevel
+	BidTree   *RBTree // maintains sorted order on every insert/delete
 
-	BestBid     *PriceLevel
 	OrderMap    map[OrderID]*Order
 	IsLocked    bool
 	TotalBidQty Qty
@@ -54,6 +50,7 @@ type AuctionBook struct {
 func NewAuctionBook() *AuctionBook {
 	return &AuctionBook{
 		BidLevels: make(map[Price]*PriceLevel),
+		BidTree:   NewRBTree(),
 		OrderMap:  make(map[OrderID]*Order),
 	}
 }
@@ -66,11 +63,12 @@ func (b *AuctionBook) AddBid(id OrderID, price Price, qty Qty) {
 	order := &Order{ID: id, Price: price, Qty: qty, OrigQty: qty, Seq: b.nextSeq}
 	b.nextSeq++
 
-	// Find or create price level — O(1)
+	// Find or create price level — O(1) lookup, O(log L) tree insert for new levels
 	level, ok := b.BidLevels[price]
 	if !ok {
 		level = &PriceLevel{Price: price}
 		b.BidLevels[price] = level
+		b.BidTree.Insert(price, level)
 	}
 
 	// Enqueue at tail — O(1)
@@ -87,30 +85,15 @@ func (b *AuctionBook) AddBid(id OrderID, price Price, qty Qty) {
 
 	// Register in order map — O(1)
 	b.OrderMap[id] = order
-
-	// Update best bid — O(1)
-	if b.BestBid == nil || price > b.BestBid.Price {
-		b.BestBid = level
-	}
-
-	b.LevelsDirty = true
 }
 
 func (b *AuctionBook) Lock() {
 	b.IsLocked = true
+}
 
-	// Collect all levels into flat array
-	b.SortedLevels = make([]*PriceLevel, 0, len(b.BidLevels))
-	for _, level := range b.BidLevels {
-		b.SortedLevels = append(b.SortedLevels, level)
-	}
-
-	// Sort descending by price — O(L log L)
-	sort.Slice(b.SortedLevels, func(i, j int) bool {
-		return b.SortedLevels[i].Price > b.SortedLevels[j].Price
-	})
-	b.LevelCount = len(b.SortedLevels)
-	b.LevelsDirty = false
+// BestBid returns the highest price level — O(log L) via tree max.
+func (b *AuctionBook) BestBid() *PriceLevel {
+	return b.BidTree.Max()
 }
 
 // ---------------------------------------------------------------------------
@@ -123,13 +106,13 @@ func (b *AuctionBook) ClearingPrice(askQty Qty) (Price, Qty) {
 	var cumulative Qty
 	var clearPrice Price
 
-	for _, level := range b.SortedLevels {
+	b.BidTree.DescendingDo(func(level *PriceLevel) {
+		if cumulative >= askQty {
+			return
+		}
 		cumulative += level.TotalQty
 		clearPrice = level.Price
-		if cumulative >= askQty {
-			break
-		}
-	}
+	})
 	return clearPrice, cumulative
 }
 
@@ -148,10 +131,9 @@ func (b *AuctionBook) RunAuction(askQty Qty, askLimit Price, minAlloc Qty) ([]Fi
 	remaining := askQty
 	var fills []FillResult
 
-	for i := 0; i < b.LevelCount && remaining > 0; i++ {
-		level := b.SortedLevels[i]
-		if level.Price < askLimit {
-			break
+	b.BidTree.DescendingDo(func(level *PriceLevel) {
+		if remaining <= 0 || level.Price < askLimit {
+			return
 		}
 
 		order := level.Head
@@ -181,7 +163,7 @@ func (b *AuctionBook) RunAuction(askQty Qty, askLimit Price, minAlloc Qty) ([]Fi
 				order = order.Next
 			}
 		}
-	}
+	})
 	return fills, askQty - remaining
 }
 
@@ -220,13 +202,13 @@ func main() {
 	// Print order book — one line per price level, descending
 	fmt.Printf("%-10s %10s %8s\n", "Price", "Volume", "Orders")
 	fmt.Println("---------- ---------- --------")
-	for _, level := range book.SortedLevels {
+	book.BidTree.DescendingDo(func(level *PriceLevel) {
 		count := 0
 		for o := level.Head; o != nil; o = o.Next {
 			count++
 		}
 		fmt.Printf("$%-9.2f %10d %8d\n", float64(level.Price)/10.0, level.TotalQty, count)
-	}
+	})
 	fmt.Println()
 
 	// Compute and display clearing price
