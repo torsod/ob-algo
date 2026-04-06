@@ -61,5 +61,5 @@ Windows:
 ### Run without building
 
 ```bash
-go run main.go
+go run .
 ```
